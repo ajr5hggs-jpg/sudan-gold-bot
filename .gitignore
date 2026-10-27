@@ -53,3 +53,8 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Telegram bot runtime data
+bot_data/
+__pycache__/
+*.py[cod]
