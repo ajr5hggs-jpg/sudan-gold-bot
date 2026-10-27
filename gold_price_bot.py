@@ -18,6 +18,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from paper_trading import PAPER_CHECK_SECONDS, PaperTradingEngine, PaperTradingError
+
 
 SOURCE_URL = "https://www.goldrate24.com/gold-prices/middle-east/sudan/"
 TELEGRAM_API_BASE = "https://api.telegram.org/bot"
@@ -238,6 +240,7 @@ class TelegramBot:
     def __init__(self, token: str, state: dict[str, Any]) -> None:
         self._token = token
         self.state = state
+        self.paper_trader = PaperTradingEngine(notify=self.send_message)
 
     def api_call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
         url = f"{TELEGRAM_API_BASE}{self._token}/{method}"
@@ -289,13 +292,22 @@ class TelegramBot:
             return
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
 
-        if command == "/start":
+        if command == "/startbot":
+            self.send_message(chat_id, self.paper_trader.start(int(chat_id)))
+        elif command == "/stopbot":
+            self.send_message(chat_id, self.paper_trader.stop(int(chat_id)))
+        elif command == "/balance":
+            self.send_message(chat_id, self.paper_trader.balance_message(int(chat_id)))
+        elif command == "/closeall":
+            self.send_message(chat_id, self.paper_trader.close_all(int(chat_id)))
+        elif command == "/start":
             self.subscribe(chat_id)
             self.send_message(
                 chat_id,
                 "تم الاشتراك في تحديث أسعار الذهب اليومي. "
                 "ستصلك الأسعار يومياً الساعة ٩ صباحاً بتوقيت الخرطوم.\n"
-                "استخدم /price لطلب الأسعار الآن أو /stop لإلغاء الاشتراك.",
+                "استخدم /price لطلب الأسعار الآن أو /stop لإلغاء الاشتراك. "
+                "للتداول التجريبي استخدم /startbot.",
             )
         elif command == "/stop":
             self.unsubscribe(chat_id)
@@ -312,7 +324,10 @@ class TelegramBot:
             self.send_message(
                 chat_id,
                 "أرسل /start للاشتراك في الأسعار اليومية، /price لطلبها الآن، "
-                "أو /stop لإلغاء الاشتراك.",
+                "أو /stop لإلغاء الاشتراك.\n"
+                "للتداول التجريبي: /startbot للتشغيل، /stopbot لإيقاف الدخول، "
+                "/balance لعرض الرصيد، و /closeall لإغلاق الصفقة المفتوحة. "
+                "التداول المحاكى لا يرسل أوامر إلى وسيط.",
             )
 
 
@@ -349,9 +364,14 @@ def run() -> None:
         SEND_HOUR,
         len(state["subscribers"]),
     )
+    logger.info(
+        "Paper trading is available per chat; market checks run every %d seconds.",
+        PAPER_CHECK_SECONDS,
+    )
 
     offset: int | None = None
     next_source_attempt = 0.0
+    next_paper_check = 0.0
     while True:
         now = datetime.now(TIMEZONE)
         today = now.date().isoformat()
@@ -383,6 +403,16 @@ def run() -> None:
         except TelegramAPIError as exc:
             logger.warning("Bot polling will retry: %s", exc)
             time.sleep(5)
+
+        if time.monotonic() >= next_paper_check or bot.paper_trader.check_requested:
+            try:
+                bot.paper_trader.run_cycle()
+            except PaperTradingError as exc:
+                logger.warning("Paper-trading cycle skipped: %s", exc)
+            except Exception:
+                logger.exception("Paper-trading cycle failed unexpectedly.")
+            finally:
+                next_paper_check = time.monotonic() + PAPER_CHECK_SECONDS
 
 
 if __name__ == "__main__":
