@@ -15,13 +15,11 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 
-SOURCE_URL = "https://t.me/s/SudaGoldPrice/12"
-LATEST_CHANNEL_URL = "https://t.me/s/SudaGoldPrice"
+SOURCE_URL = "https://www.goldrate24.com/gold-prices/middle-east/sudan/"
 TELEGRAM_API_BASE = "https://api.telegram.org/bot"
 TIMEZONE = ZoneInfo("Africa/Khartoum")
 SEND_HOUR = 9
@@ -58,20 +56,12 @@ MONTHS_AR = (
     "ديسمبر",
 )
 
-PRICE_LABELS = {
-    "21k": re.compile(
-        r"(?:\b21\s*(?:k|karat|carat)\b|(?:عيار|قيراط)\s*21\b|\b21\s*عيار\b)",
-        re.IGNORECASE,
-    ),
-    "24k": re.compile(
-        r"(?:\b24\s*(?:k|karat|carat)\b|(?:عيار|قيراط)\s*24\b|\b24\s*عيار\b)",
-        re.IGNORECASE,
-    ),
-    "ounce": re.compile(r"(?:الأونصة|الاونصة|أونصة|اوقية|أوقية|ounce|oz)", re.IGNORECASE),
+PRICE_ROW_LABELS = {
+    "gold gram 21k": "21k",
+    "gold gram 24k": "24k",
+    "gold ounce 24k": "ounce",
 }
-NUMBER_PATTERN = re.compile(
-    r"(?<!\d)(?:\d{1,3}(?:[,٬\s]\d{3})+|\d+)(?:[.٫]\d+)?"
-)
+PRICE_VALUE_PATTERN = re.compile(r"^\s*([\d,]+(?:\.\d+)?)\s*$")
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -88,45 +78,41 @@ class TelegramAPIError(RuntimeError):
     """A Telegram Bot API request failed without exposing request credentials."""
 
 
-class TelegramPostParser(HTMLParser):
-    """Collect Telegram public-preview message text from the page HTML."""
+class GoldPricePageParser(HTMLParser):
+    """Read the labeled SDG price cells from the public Sudan rates page."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.messages: list[str] = []
-        self._inside_message = False
-        self._div_depth = 0
-        self._current: list[str] = []
+        self.rows: list[list[str]] = []
+        self._inside_row = False
+        self._inside_cell = False
+        self._current_row: list[str] = []
+        self._current_cell: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attributes = dict(attrs)
-        classes = (attributes.get("class") or "").split()
-        if not self._inside_message and tag == "div" and "tgme_widget_message_text" in classes:
-            self._inside_message = True
-            self._div_depth = 1
-            self._current = []
-            return
-
-        if self._inside_message:
-            if tag == "div":
-                self._div_depth += 1
-            elif tag == "br":
-                self._current.append("\n")
+        if tag == "tr":
+            self._inside_row = True
+            self._current_row = []
+        elif self._inside_row and tag in ("th", "td"):
+            self._inside_cell = True
+            self._current_cell = []
+        elif self._inside_cell and tag == "br":
+            self._current_cell.append(" ")
 
     def handle_endtag(self, tag: str) -> None:
-        if not self._inside_message or tag != "div":
-            return
-        self._div_depth -= 1
-        if self._div_depth == 0:
-            message = "".join(self._current).strip()
-            if message:
-                self.messages.append(message)
-            self._inside_message = False
-            self._current = []
+        if tag in ("th", "td") and self._inside_cell:
+            self._current_row.append(" ".join("".join(self._current_cell).split()))
+            self._inside_cell = False
+            self._current_cell = []
+        elif tag == "tr" and self._inside_row:
+            if self._current_row:
+                self.rows.append(self._current_row)
+            self._inside_row = False
+            self._current_row = []
 
     def handle_data(self, data: str) -> None:
-        if self._inside_message:
-            self._current.append(data)
+        if self._inside_cell:
+            self._current_cell.append(data)
 
 
 def normalize_digits(value: str) -> str:
@@ -144,34 +130,6 @@ def _clean_price(raw_value: str) -> str:
     return format(value, "f")
 
 
-def extract_prices(text: str) -> dict[str, str]:
-    """Extract 21k, 24k and ounce values from a Telegram post's plain text."""
-    normalized = normalize_digits(text)
-    matches: list[tuple[int, int, str]] = []
-    for key, pattern in PRICE_LABELS.items():
-        match = pattern.search(normalized)
-        if match:
-            matches.append((match.start(), match.end(), key))
-    matches.sort()
-
-    prices: dict[str, str] = {}
-    for index, (start, end, key) in enumerate(matches):
-        if key in prices:
-            continue
-        next_label_start = matches[index + 1][0] if index + 1 < len(matches) else len(normalized)
-        value_region = normalized[end : min(next_label_start, end + 180)]
-        number_match = NUMBER_PATTERN.search(value_region)
-        if number_match:
-            prices[key] = _clean_price(number_match.group(0))
-
-    missing = [key for key in PRICE_LABELS if key not in prices]
-    if missing:
-        raise PriceSourceError(
-            "The source page does not expose all three prices (21k, 24k and ounce)."
-        )
-    return prices
-
-
 def fetch_source_html(url: str) -> str:
     request = Request(
         url,
@@ -181,28 +139,35 @@ def fetch_source_html(url: str) -> str:
         with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             return response.read(1_500_000).decode("utf-8", errors="replace")
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        raise PriceSourceError("Could not reach the Telegram price page.") from exc
+        raise PriceSourceError("Could not reach the public gold-price page.") from exc
 
 
 def scrape_prices_from_html(html: str) -> dict[str, str]:
-    parser = TelegramPostParser()
+    parser = GoldPricePageParser()
     parser.feed(html)
-    if not parser.messages:
+    prices: dict[str, str] = {}
+    for row in parser.rows:
+        if len(row) < 2:
+            continue
+        key = PRICE_ROW_LABELS.get(" ".join(row[0].lower().split()))
+        if not key or key in prices:
+            continue
+        normalized = normalize_digits(row[1])
+        match = PRICE_VALUE_PATTERN.fullmatch(normalized)
+        if match:
+            prices[key] = _clean_price(match.group(1))
+
+    missing = [key for key in ("21k", "24k", "ounce") if key not in prices]
+    if missing:
         raise PriceSourceError(
-            "Telegram returned a contact page, not readable channel posts."
+            "GoldRate24 did not expose all three Sudan rates (21k, 24k and ounce)."
         )
-    return extract_prices("\n".join(parser.messages))
+    return prices
 
 
 def fetch_prices() -> dict[str, str]:
-    """Try the supplied post URL first, then the public channel's latest-post page."""
-    errors: list[str] = []
-    for url in (SOURCE_URL, LATEST_CHANNEL_URL):
-        try:
-            return scrape_prices_from_html(fetch_source_html(url))
-        except PriceSourceError as exc:
-            errors.append(str(exc))
-    raise PriceSourceError(errors[-1] if errors else "No price source is configured.")
+    """Fetch the latest GoldRate24 Sudan 21k, 24k gram and 24k ounce prices in SDG."""
+    return scrape_prices_from_html(fetch_source_html(SOURCE_URL))
 
 
 def format_price(value: str) -> str:
@@ -223,10 +188,11 @@ def build_daily_message(prices: dict[str, str], moment: datetime) -> str:
             "أسعار الذهب في السودان",
             format_arabic_date(moment),
             "",
-            f"عيار ٢١: {format_price(prices['21k'])}",
-            f"عيار ٢٤: {format_price(prices['24k'])}",
-            f"الأونصة: {format_price(prices['ounce'])}",
+            f"عيار ٢١ للغرام: {format_price(prices['21k'])} جنيه سوداني",
+            f"عيار ٢٤ للغرام: {format_price(prices['24k'])} جنيه سوداني",
+            f"أونصة ٢٤ قيراط: {format_price(prices['ounce'])} جنيه سوداني",
             "",
+            "الأسعار خام وقد تختلف أسعار البيع بحسب المصنعية والرسوم.",
             f"المصدر: {SOURCE_URL}",
         )
     )

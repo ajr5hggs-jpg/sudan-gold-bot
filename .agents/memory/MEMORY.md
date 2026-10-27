@@ -1,0 +1,1 @@
+- [Telegram source accessibility](telegram-source-accessibility.md) — verify that a post link returns message content before using it as a scheduled data feed.
