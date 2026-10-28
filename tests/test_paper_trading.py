@@ -2,13 +2,16 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from paper_trading import (
     Candle,
     MarketData,
+    PaperTradingError,
     PaperTradingEngine,
     crossover_signal,
     ema_series,
+    fetch_market_data,
     is_market_open,
     position_size_ounces,
     rsi_series,
@@ -37,6 +40,48 @@ class IndicatorTests(unittest.TestCase):
 
     def test_two_percent_risk_sizes_in_ounces(self) -> None:
         self.assertEqual(position_size_ounces(10_000, 1.50), 133.3333)
+
+    def test_yfinance_tickers_are_tried_in_order_until_one_works(self) -> None:
+        successful = MarketData(
+            [Candle(index * 900, 4000.0, 4001.0, 3999.0, 4000.0) for index in range(200)],
+            4000.0,
+            "Yahoo GC=F",
+            "GC=F",
+        )
+        with patch(
+            "paper_trading._fetch_yahoo",
+            side_effect=[PaperTradingError("no spot data"), successful],
+        ) as fetch:
+            result = fetch_market_data()
+
+        self.assertIs(result, successful)
+        self.assertEqual(
+            [call.args[0] for call in fetch.call_args_list],
+            ["XAUUSD=X", "GC=F"],
+        )
+
+    def test_paxg_is_the_last_yfinance_fallback(self) -> None:
+        successful = MarketData(
+            [Candle(index * 900, 4000.0, 4001.0, 3999.0, 4000.0) for index in range(200)],
+            4000.0,
+            "Yahoo PAXG-USD",
+            "PAXG-USD",
+        )
+        with patch(
+            "paper_trading._fetch_yahoo",
+            side_effect=[
+                PaperTradingError("no XAUUSD data"),
+                PaperTradingError("no GC=F data"),
+                successful,
+            ],
+        ) as fetch:
+            result = fetch_market_data()
+
+        self.assertIs(result, successful)
+        self.assertEqual(
+            [call.args[0] for call in fetch.call_args_list],
+            ["XAUUSD=X", "GC=F", "PAXG-USD"],
+        )
 
 
 class SessionTests(unittest.TestCase):
@@ -120,6 +165,31 @@ class PaperAccountTests(unittest.TestCase):
             )
 
             self.assertIsNone(engine.accounts["303"]["position"])
+            self.assertEqual(notifications, [])
+
+    def test_trade_command_evaluates_latest_closed_bar_and_opens_demo_position(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            notifications: list[tuple[int, str]] = []
+            candles = [
+                Candle(index * 900, 4000.0, 4000.5, 3999.5, 4000.0)
+                for index in range(210)
+            ]
+            market = MarketData(candles, 4000.0, "Yahoo GC=F", "GC=F")
+            engine = PaperTradingEngine(
+                notify=lambda chat_id, message: notifications.append((chat_id, message)),
+                state_path=Path(directory) / "paper.json",
+                market_data_loader=lambda _preferred: market,
+            )
+
+            with (
+                patch("paper_trading.is_market_open", return_value=True),
+                patch("paper_trading.crossover_signal", return_value="long"),
+            ):
+                message = engine.trade_now(404)
+
+            self.assertIn("شراء تجريبية", message)
+            self.assertEqual(engine.accounts["404"]["position"]["side"], "long")
+            self.assertEqual(engine.accounts["404"]["last_processed_candle"], candles[-1].timestamp)
             self.assertEqual(notifications, [])
 
 

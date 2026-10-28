@@ -7,23 +7,19 @@ import logging
 import math
 import os
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, time as wall_time, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
 
-YAHOO_TICKERS = ("XAUUSD=X", "GC=F")
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-XAUS_CHART_URL = "https://xaus.com/api/v1/chart"
-XAUS_SPOT_URL = "https://xaus.com/api/v1/spot"
+YAHOO_TICKERS = ("XAUUSD=X", "GC=F", "PAXG-USD")
 PAPER_STATE_PATH = Path(__file__).parent / "bot_data" / "paper_accounts.json"
 BAR_SECONDS = 15 * 60
 PAPER_CHECK_SECONDS = 5 * 60
@@ -38,6 +34,15 @@ REQUEST_TIMEOUT_SECONDS = 20
 NEW_YORK = ZoneInfo("America/New_York")
 
 logger = logging.getLogger("paper-trader")
+
+
+def synchronized(method: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(method)
+    def wrapped(self: PaperTradingEngine, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 class PaperTradingError(RuntimeError):
@@ -195,7 +200,10 @@ def _parse_yahoo_frame(frame: Any, ticker: str, now_epoch: float) -> MarketData:
             high_price = _finite_float(highs.iloc[index])
             low_price = _finite_float(lows.iloc[index])
             close_price = _finite_float(closes.iloc[index])
-            volume = _finite_float(volumes.iloc[index])
+            try:
+                volume = _finite_float(volumes.iloc[index])
+            except (TypeError, ValueError, OverflowError):
+                volume = 0.0
         except (TypeError, ValueError, OverflowError):
             continue
         if close_price <= 0 or high_price < low_price:
@@ -218,7 +226,9 @@ def _parse_yahoo_frame(frame: Any, ticker: str, now_epoch: float) -> MarketData:
         raise PaperTradingError("Yahoo returned too few completed 15-minute candles.")
 
     if ticker == "GC=F":
-        source = "Yahoo GC=F (COMEX gold-futures proxy)"
+        source = "Yahoo GC=F (gold-futures proxy, not spot XAUUSD)"
+    elif ticker == "PAXG-USD":
+        source = "Yahoo PAXG-USD (tokenized-gold proxy)"
     else:
         source = "Yahoo XAUUSD=X (spot)"
     return MarketData(candles, latest_price, source, ticker)
@@ -239,108 +249,8 @@ def _fetch_yahoo(ticker: str, now_epoch: float) -> MarketData:
     return _parse_yahoo_frame(frame, ticker, now_epoch)
 
 
-def _get_json(url: str) -> Any:
-    request = Request(url, headers={"User-Agent": "PaperTrader/1.0"})
-    try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        raise PaperTradingError(f"Market-data request failed (HTTP {exc.code}).") from None
-    except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise PaperTradingError("Market-data request could not be completed.") from None
-
-
-def _require_fresh_state(payload: dict[str, Any]) -> None:
-    state = payload.get("data_state")
-    if not isinstance(state, dict) or state.get("status") != "fresh":
-        raise PaperTradingError("The public XAU/USD feed is stale or unavailable.")
-    try:
-        age = float(state.get("age_seconds", 0))
-    except (TypeError, ValueError):
-        age = MAX_QUOTE_AGE_SECONDS + 1
-    if age > MAX_QUOTE_AGE_SECONDS:
-        raise PaperTradingError("The public XAU/USD feed is too old to trade safely.")
-
-
-def _fetch_binance(now_epoch: float) -> MarketData:
-    query = urlencode({"symbol": "PAXGUSDT", "interval": "15m", "limit": 500})
-    rows = _get_json(f"{BINANCE_KLINES_URL}?{query}")
-    if not isinstance(rows, list):
-        raise PaperTradingError("Binance returned an unexpected candle format.")
-    candles: list[Candle] = []
-    latest_price: float | None = None
-    for row in rows:
-        if not isinstance(row, list) or len(row) < 7:
-            continue
-        try:
-            timestamp = int(row[0] / 1000)
-            open_price, high, low, close = (
-                _finite_float(row[1]),
-                _finite_float(row[2]),
-                _finite_float(row[3]),
-                _finite_float(row[4]),
-            )
-            volume = _finite_float(row[5])
-            close_time = int(row[6] / 1000)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        latest_price = close
-        if close_time < now_epoch:
-            candles.append(Candle(timestamp, open_price, high, low, close, volume))
-    if len(candles) < MIN_HISTORY_BARS or latest_price is None:
-        raise PaperTradingError("Binance returned too few PAXG candles.")
-    return MarketData(
-        candles,
-        latest_price,
-        "Binance PAXGUSDT (tokenized-gold proxy)",
-    )
-
-
-def _fetch_xaus(now_epoch: float) -> MarketData:
-    query = urlencode({"symbol": "xau", "range": "5d", "interval": "15m"})
-    chart = _get_json(f"{XAUS_CHART_URL}?{query}")
-    if not isinstance(chart, dict):
-        raise PaperTradingError("The XAU/USD feed returned an unexpected chart format.")
-    _require_fresh_state(chart)
-    points = chart.get("points")
-    if not isinstance(points, list):
-        raise PaperTradingError("The XAU/USD feed returned no candles.")
-
-    candles: list[Candle] = []
-    for point in points:
-        if not isinstance(point, dict):
-            continue
-        try:
-            timestamp = int(point["t"])
-            candle = Candle(
-                timestamp,
-                _finite_float(point["o"]),
-                _finite_float(point["h"]),
-                _finite_float(point["l"]),
-                _finite_float(point["c"]),
-                _finite_float(point.get("v", 0)),
-            )
-        except (KeyError, TypeError, ValueError, OverflowError):
-            continue
-        if timestamp % BAR_SECONDS == 0 and timestamp + BAR_SECONDS <= now_epoch:
-            candles.append(candle)
-    candles.sort(key=lambda candle: candle.timestamp)
-    if len(candles) < MIN_HISTORY_BARS:
-        raise PaperTradingError("The XAU/USD feed returned too few completed candles.")
-
-    spot_query = urlencode({"currency": "USD", "unit": "oz", "compact": "1"})
-    spot = _get_json(f"{XAUS_SPOT_URL}?{spot_query}")
-    if not isinstance(spot, dict):
-        raise PaperTradingError("The XAU/USD feed returned an unexpected spot format.")
-    _require_fresh_state(spot)
-    price = _finite_float(spot.get("spot_usd_oz"))
-    if price <= 0:
-        raise PaperTradingError("The XAU/USD feed returned an invalid spot price.")
-    return MarketData(candles, price, "XAUS XAU/USD spot")
-
-
 def fetch_market_data(preferred_yahoo_ticker: str | None = None) -> MarketData:
-    """Fetch Yahoo 15m candles first; use public fallbacks only if Yahoo fails."""
+    """Use the first working yfinance ticker in the configured order."""
     now_epoch = time.time()
     yahoo_order = [preferred_yahoo_ticker] if preferred_yahoo_ticker else []
     yahoo_order.extend(ticker for ticker in YAHOO_TICKERS if ticker not in yahoo_order)
@@ -350,23 +260,12 @@ def fetch_market_data(preferred_yahoo_ticker: str | None = None) -> MarketData:
         try:
             return _fetch_yahoo(ticker, now_epoch)
         except Exception as exc:
-            errors.append(f"Yahoo {ticker}: {type(exc).__name__}")
-            logger.info("Yahoo %s is unavailable; trying the next public feed.", ticker)
+            errors.append(f"{ticker}: {type(exc).__name__}")
+            logger.info("yfinance ticker %s is unavailable; trying the next ticker.", ticker)
 
-    try:
-        return _fetch_binance(now_epoch)
-    except Exception as exc:
-        errors.append(f"Binance PAXG: {type(exc).__name__}")
-        logger.info("Binance PAXG data is unavailable; trying public XAU/USD spot data.")
-
-    try:
-        return _fetch_xaus(now_epoch)
-    except Exception as exc:
-        errors.append(f"XAU/USD spot: {type(exc).__name__}")
-
-    logger.warning("All paper-trading market feeds failed: %s", ", ".join(errors))
+    logger.warning("All yfinance tickers failed: %s", ", ".join(errors))
     raise PaperTradingError(
-        "Yahoo, Binance PAXG, and public XAU/USD market data are unavailable."
+        "No usable 15-minute data was returned by XAUUSD=X, GC=F, or PAXG-USD."
     )
 
 
@@ -397,6 +296,7 @@ class PaperTradingEngine:
         self.state_path = state_path
         self.market_data_loader = market_data_loader
         self.accounts = self._load_accounts()
+        self._lock = threading.RLock()
         self.last_market_data: MarketData | None = None
         self.preferred_yahoo_ticker: str | None = None
         self._check_requested = False
@@ -449,8 +349,10 @@ class PaperTradingEngine:
         key = str(chat_id)
         if key not in self.accounts:
             self.accounts[key] = _new_account()
+            self._save()
         return self.accounts[key]
 
+    @synchronized
     def start(self, chat_id: int) -> str:
         account = self._account(chat_id)
         already_enabled = bool(account["enabled"])
@@ -466,10 +368,11 @@ class PaperTradingEngine:
             "تم تشغيل التداول التجريبي لهذا الحساب.\n"
             "لا تُرسل أوامر حقيقية إلى وسيط. يبدأ الدخول عند إغلاق شمعة M15 مؤهلة؛ "
             "قد ينتظر الحساب اكتمال بيانات EMA 200.\n"
-            "مصدر البيانات: Yahoo عبر yfinance، ثم GC=F عند تعذر XAUUSD=X. "
-            "استخدم /stopbot لإيقاف الدخول."
+            "مصدر البيانات: yfinance بالترتيب XAUUSD=X ثم GC=F ثم PAXG-USD. "
+            "استخدم /auto_off لإيقاف الدخول."
         )
 
+    @synchronized
     def stop(self, chat_id: int) -> str:
         account = self._account(chat_id)
         account["enabled"] = False
@@ -484,6 +387,7 @@ class PaperTradingEngine:
             )
         return "تم إيقاف التداول التجريبي لهذا الحساب."
 
+    @synchronized
     def balance_message(self, chat_id: int) -> str:
         account = self._account(chat_id)
         balance = float(account["balance_usd"])
@@ -516,6 +420,7 @@ class PaperTradingEngine:
             f"الصفقات المغلقة: {int(account['closed_trades'])}"
         )
 
+    @synchronized
     def close_all(self, chat_id: int) -> str:
         account = self._account(chat_id)
         position = account.get("position")
@@ -534,6 +439,58 @@ class PaperTradingEngine:
         self._save()
         return message
 
+    @synchronized
+    def trade_now(self, chat_id: int) -> str:
+        account = self._account(chat_id)
+        if account.get("position"):
+            return "لديك صفقة تجريبية مفتوحة بالفعل؛ لن أفتح صفقة ثانية."
+        if not is_market_open():
+            return "سوق الذهب مغلق الآن؛ لم يتم فتح صفقة."
+
+        market = self.market_data_loader(self.preferred_yahoo_ticker)
+        self.last_market_data = market
+        if market.yahoo_ticker:
+            self.preferred_yahoo_ticker = market.yahoo_ticker
+        account["last_price"] = market.price
+        account["last_price_at"] = time.time()
+        account["source"] = market.source
+
+        candles = sorted(market.candles, key=lambda candle: candle.timestamp)
+        if len(candles) < MIN_HISTORY_BARS:
+            return "لا توجد بيانات كافية لحساب EMA 200؛ لم يتم فتح صفقة."
+        latest_index = len(candles) - 1
+        latest = candles[latest_index]
+        if latest.timestamp <= int(account.get("last_processed_candle") or 0):
+            self._save()
+            return "تم فحص آخر شمعة M15 بالفعل؛ لا توجد إشارة جديدة للتنفيذ."
+
+        closes = [candle.close for candle in candles]
+        signal = crossover_signal(
+            latest_index,
+            ema_series(closes, 50),
+            ema_series(closes, 200),
+            rsi_series(closes, 14),
+        )
+        account["last_processed_candle"] = latest.timestamp
+        if signal is None:
+            self._save()
+            return (
+                "لا يوجد تقاطع جديد مؤكد بإشارة RSI على آخر شمعة M15 مكتملة؛ "
+                "لم يتم فتح صفقة."
+            )
+
+        message = self._open_position(
+            chat_id,
+            account,
+            latest,
+            signal,
+            market.source,
+            notify_chat=False,
+        )
+        self._save()
+        return message
+
+    @synchronized
     def run_cycle(self, moment: datetime | None = None) -> None:
         self._check_requested = False
         current = moment or datetime.now(timezone.utc)
@@ -551,6 +508,7 @@ class PaperTradingEngine:
             self.preferred_yahoo_ticker = market.yahoo_ticker
         self.process_market_data(market, current)
 
+    @synchronized
     def process_market_data(self, market: MarketData, moment: datetime | None = None) -> None:
         current = moment or datetime.now(timezone.utc)
         if current.tzinfo is None:
@@ -563,7 +521,6 @@ class PaperTradingEngine:
         fast_ema = ema_series(closes, 50)
         slow_ema = ema_series(closes, 200)
         rsi = rsi_series(closes, 14)
-        indexes = {candle.timestamp: index for index, candle in enumerate(candles)}
         now_epoch = current.timestamp()
 
         for chat_key, account in self.accounts.items():
@@ -618,12 +575,13 @@ class PaperTradingEngine:
         candle: Candle,
         side: str,
         source: str,
-    ) -> None:
+        notify_chat: bool = True,
+    ) -> str:
         balance = float(account["balance_usd"])
         stop_distance = STOP_POINTS * POINT_SIZE_USD
         size = position_size_ounces(balance, stop_distance)
         if size <= 0:
-            return
+            return "الرصيد التجريبي لا يكفي لفتح صفقة."
         entry = round(candle.close, 2)
         if side == "long":
             stop = round(entry - stop_distance, 2)
@@ -653,8 +611,10 @@ class PaperTradingEngine:
             f"مصدر السعر: {source}\n"
             "محاكاة فقط؛ لا يتم إرسال أوامر حقيقية."
         )
-        self._notify(chat_id, message)
+        if notify_chat:
+            self._notify(chat_id, message)
         logger.info("Paper position opened from a new M15 crossover.")
+        return message
 
     def _candle_exit(self, position: dict[str, Any], candle: Candle) -> tuple[float, str] | None:
         stop = float(position["stop_price"])

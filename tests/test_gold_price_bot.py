@@ -1,5 +1,7 @@
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from gold_price_bot import (
@@ -8,6 +10,7 @@ from gold_price_bot import (
     build_daily_message,
     format_price,
     scrape_prices_from_html,
+    start_command,
 )
 
 
@@ -50,6 +53,29 @@ class GoldPriceParsingTests(unittest.TestCase):
         self.assertIn("عيار ٢٤ للغرام: ٧٨٬٦٠٢٫٧٦ جنيه سوداني", message)
         self.assertIn("أونصة ٢٤ قيراط: ٢٬٤٤٤٬٥٤٥٫٧٤ جنيه سوداني", message)
         self.assertIn(SOURCE_URL, message)
+
+
+class TelegramMenuTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_subscribes_and_shows_menu(self) -> None:
+        state = {"subscribers": [], "last_sent_date": ""}
+        reply_text = AsyncMock()
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=SimpleNamespace(reply_text=reply_text),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"state": state})
+        )
+
+        with patch("gold_price_bot.save_state") as save_state:
+            await start_command(update, context)
+
+        self.assertEqual(state["subscribers"], [1234])
+        save_state.assert_called_once_with(state)
+        reply = reply_text.await_args.args[0]
+        self.assertIn("/trade", reply)
+        self.assertIn("/auto_on", reply)
+        self.assertIn("/price", reply)
 
 
 if __name__ == "__main__":

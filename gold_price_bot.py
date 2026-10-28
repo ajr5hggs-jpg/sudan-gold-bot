@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -19,10 +20,12 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from paper_trading import PAPER_CHECK_SECONDS, PaperTradingEngine, PaperTradingError
+from telegram import BotCommand, Update
+from telegram.error import Forbidden, TelegramError
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 
 SOURCE_URL = "https://www.goldrate24.com/gold-prices/middle-east/sudan/"
-TELEGRAM_API_BASE = "https://api.telegram.org/bot"
 TIMEZONE = ZoneInfo("Africa/Khartoum")
 SEND_HOUR = 9
 RETRY_SECONDS = 60 * 60
@@ -69,15 +72,13 @@ logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(message)s",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("gold-price-bot")
 
 
 class PriceSourceError(RuntimeError):
     """Raised when a usable set of prices cannot be read from the source."""
-
-
-class TelegramAPIError(RuntimeError):
-    """A Telegram Bot API request failed without exposing request credentials."""
 
 
 class GoldPricePageParser(HTMLParser):
@@ -236,117 +237,263 @@ def save_state(state: dict[str, Any]) -> None:
             os.unlink(temporary_path)
 
 
-class TelegramBot:
-    def __init__(self, token: str, state: dict[str, Any]) -> None:
-        self._token = token
-        self.state = state
-        self.paper_trader = PaperTradingEngine(notify=self.send_message)
+MENU_TEXT = (
+    "الأوامر المتاحة:\n"
+    "/price — أسعار الذهب السوداني الآن\n"
+    "/balance — رصيد الحساب التجريبي (١٠٬٠٠٠ دولار)\n"
+    "/trade — فحص إشارة EMA/RSI الآن\n"
+    "/auto_on — تشغيل الفحص الآلي كل ٥ دقائق\n"
+    "/auto_off — إيقاف فتح صفقات جديدة\n"
+    "/closeall — إغلاق الصفقة التجريبية المفتوحة\n"
+    "/stop — إلغاء تحديثات الأسعار اليومية فقط\n\n"
+    "التداول تجريبي فقط ولا يرسل أوامر إلى وسيط."
+)
 
-    def api_call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
-        url = f"{TELEGRAM_API_BASE}{self._token}/{method}"
-        body = json.dumps(payload or {}).encode("utf-8")
-        request = Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+
+def subscribe_chat(state: dict[str, Any], chat_id: int) -> None:
+    subscribers = state["subscribers"]
+    if chat_id not in subscribers:
+        subscribers.append(chat_id)
+        save_state(state)
+
+
+def unsubscribe_chat(state: dict[str, Any], chat_id: int) -> None:
+    subscribers = state["subscribers"]
+    if chat_id in subscribers:
+        subscribers.remove(chat_id)
+        save_state(state)
+
+
+def paper_trader_from(context: ContextTypes.DEFAULT_TYPE) -> PaperTradingEngine:
+    return context.application.bot_data["paper_trader"]
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.effective_message:
+        return
+    chat_id = update.effective_chat.id
+    state = context.application.bot_data["state"]
+    subscribe_chat(state, chat_id)
+    await update.effective_message.reply_text(
+        "تم الاشتراك في أسعار الذهب اليومية الساعة ٩ صباحاً بتوقيت الخرطوم.\n\n"
+        + MENU_TEXT
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message:
+        await update.effective_message.reply_text(MENU_TEXT)
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.effective_message:
+        return
+    unsubscribe_chat(context.application.bot_data["state"], update.effective_chat.id)
+    await update.effective_message.reply_text(
+        "تم إلغاء تحديثات أسعار الذهب اليومية. إعداد التداول التجريبي لم يتغير."
+    )
+
+
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_message:
+        return
+    try:
+        prices = await asyncio.to_thread(fetch_prices)
+    except PriceSourceError:
+        await update.effective_message.reply_text(
+            "تعذر قراءة الأسعار من المصدر حالياً. لن أرسل أسعاراً غير مؤكدة؛ يرجى المحاولة لاحقاً."
         )
-        try:
-            with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            raise TelegramAPIError(f"Telegram API {method} failed (HTTP {exc.code}).") from None
-        except (URLError, TimeoutError, OSError, json.JSONDecodeError):
-            raise TelegramAPIError(f"Telegram API {method} could not be completed.") from None
-        if not result.get("ok"):
-            error_code = result.get("error_code", "unknown")
-            raise TelegramAPIError(f"Telegram API {method} returned error {error_code}.")
-        return result.get("result")
+        return
+    await update.effective_message.reply_text(
+        build_daily_message(prices, datetime.now(TIMEZONE))
+    )
 
-    def send_message(self, chat_id: int | str, text: str) -> None:
-        self.api_call(
-            "sendMessage",
-            {"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.effective_message:
+        return
+    text = await asyncio.to_thread(
+        paper_trader_from(context).balance_message, update.effective_chat.id
+    )
+    await update.effective_message.reply_text(text)
+
+
+async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.effective_message:
+        return
+    try:
+        text = await asyncio.to_thread(
+            paper_trader_from(context).trade_now, update.effective_chat.id
         )
-
-    def subscribe(self, chat_id: int) -> None:
-        subscribers = self.state["subscribers"]
-        if chat_id not in subscribers:
-            subscribers.append(chat_id)
-            save_state(self.state)
-
-    def unsubscribe(self, chat_id: int) -> None:
-        subscribers = self.state["subscribers"]
-        if chat_id in subscribers:
-            subscribers.remove(chat_id)
-            save_state(self.state)
-
-    def handle_update(self, update: dict[str, Any]) -> None:
-        message = update.get("message")
-        if not isinstance(message, dict):
-            return
-        chat = message.get("chat") or {}
-        chat_id = chat.get("id")
-        text = str(message.get("text") or "").strip()
-        if chat_id is None or not text.startswith("/"):
-            return
-        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
-
-        if command == "/startbot":
-            self.send_message(chat_id, self.paper_trader.start(int(chat_id)))
-        elif command == "/stopbot":
-            self.send_message(chat_id, self.paper_trader.stop(int(chat_id)))
-        elif command == "/balance":
-            self.send_message(chat_id, self.paper_trader.balance_message(int(chat_id)))
-        elif command == "/closeall":
-            self.send_message(chat_id, self.paper_trader.close_all(int(chat_id)))
-        elif command == "/start":
-            self.subscribe(chat_id)
-            self.send_message(
-                chat_id,
-                "تم الاشتراك في تحديث أسعار الذهب اليومي. "
-                "ستصلك الأسعار يومياً الساعة ٩ صباحاً بتوقيت الخرطوم.\n"
-                "استخدم /price لطلب الأسعار الآن أو /stop لإلغاء الاشتراك. "
-                "للتداول التجريبي استخدم /startbot.",
-            )
-        elif command == "/stop":
-            self.unsubscribe(chat_id)
-            self.send_message(chat_id, "تم إلغاء الاشتراك في تحديثات أسعار الذهب.")
-        elif command == "/price":
-            try:
-                self.send_message(chat_id, build_daily_message(fetch_prices(), datetime.now(TIMEZONE)))
-            except PriceSourceError:
-                self.send_message(
-                    chat_id,
-                    "تعذر قراءة الأسعار من المصدر حالياً. لن أرسل أسعاراً غير مؤكدة؛ يرجى المحاولة لاحقاً.",
-                )
-        elif command == "/help":
-            self.send_message(
-                chat_id,
-                "أرسل /start للاشتراك في الأسعار اليومية، /price لطلبها الآن، "
-                "أو /stop لإلغاء الاشتراك.\n"
-                "للتداول التجريبي: /startbot للتشغيل، /stopbot لإيقاف الدخول، "
-                "/balance لعرض الرصيد، و /closeall لإغلاق الصفقة المفتوحة. "
-                "التداول المحاكى لا يرسل أوامر إلى وسيط.",
-            )
+    except PaperTradingError as exc:
+        logger.warning("Manual paper trade could not be evaluated: %s", exc)
+        text = "تعذر جلب شموع ١٥ دقيقة من yfinance؛ لم يتم فتح صفقة."
+    await update.effective_message.reply_text(text)
 
 
-def send_daily_update(bot: TelegramBot, state: dict[str, Any], today: str) -> None:
-    prices = fetch_prices()
+async def auto_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.effective_message:
+        return
+    text = await asyncio.to_thread(
+        paper_trader_from(context).start, update.effective_chat.id
+    )
+    context.application.bot_data["worker_wakeup"].set()
+    await update.effective_message.reply_text(text)
+
+
+async def auto_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.effective_message:
+        return
+    text = await asyncio.to_thread(
+        paper_trader_from(context).stop, update.effective_chat.id
+    )
+    context.application.bot_data["worker_wakeup"].set()
+    await update.effective_message.reply_text(text)
+
+
+async def closeall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.effective_message:
+        return
+    text = await asyncio.to_thread(
+        paper_trader_from(context).close_all, update.effective_chat.id
+    )
+    await update.effective_message.reply_text(text)
+
+
+async def send_daily_update(
+    application: Application, state: dict[str, Any], today: str
+) -> None:
+    prices = await asyncio.to_thread(fetch_prices)
     message = build_daily_message(prices, datetime.now(TIMEZONE))
     subscribers = list(state["subscribers"])
     if not subscribers:
         logger.info("Prices were read for %s; there are no subscribers yet.", today)
     for chat_id in subscribers:
         try:
-            bot.send_message(chat_id, message)
-        except TelegramAPIError as exc:
-            logger.warning("Could not send the daily update to a subscriber: %s", exc)
-            if "error 403" in str(exc):
-                bot.unsubscribe(chat_id)
+            await application.bot.send_message(chat_id=chat_id, text=message)
+        except Forbidden:
+            logger.info("Removing a Telegram chat that no longer accepts messages.")
+            unsubscribe_chat(state, chat_id)
+        except TelegramError as exc:
+            logger.warning("Could not send a daily price update: %s", exc)
     state["last_sent_date"] = today
     save_state(state)
     logger.info("Daily price update completed for %s.", today)
+
+
+async def notification_worker(application: Application) -> None:
+    queue = application.bot_data["paper_notifications"]
+    while True:
+        chat_id, text = await queue.get()
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                disable_web_page_preview=True,
+            )
+        except TelegramError as exc:
+            logger.warning("Could not send a paper-trading notification: %s", exc)
+        finally:
+            queue.task_done()
+
+
+async def background_worker(application: Application) -> None:
+    state = application.bot_data["state"]
+    paper_trader = application.bot_data["paper_trader"]
+    wakeup = application.bot_data["worker_wakeup"]
+    next_source_attempt = 0.0
+    next_paper_check = 0.0
+
+    while True:
+        now = datetime.now(TIMEZONE)
+        today = now.date().isoformat()
+        monotonic_now = time.monotonic()
+        if (
+            now.hour >= SEND_HOUR
+            and state.get("last_sent_date") != today
+            and monotonic_now >= next_source_attempt
+        ):
+            try:
+                await send_daily_update(application, state, today)
+            except PriceSourceError as exc:
+                logger.warning("Daily update postponed: %s", exc)
+                next_source_attempt = time.monotonic() + RETRY_SECONDS
+            except TelegramError as exc:
+                logger.warning("Daily update could not be delivered: %s", exc)
+                next_source_attempt = time.monotonic() + RETRY_SECONDS
+
+        if time.monotonic() >= next_paper_check or paper_trader.check_requested:
+            try:
+                await asyncio.to_thread(paper_trader.run_cycle)
+            except PaperTradingError as exc:
+                logger.warning("Paper-trading cycle skipped: %s", exc)
+            except Exception:
+                logger.exception("Paper-trading cycle failed unexpectedly.")
+            finally:
+                next_paper_check = time.monotonic() + PAPER_CHECK_SECONDS
+
+        timeout = min(25.0, max(1.0, next_paper_check - time.monotonic()))
+        try:
+            await asyncio.wait_for(wakeup.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        wakeup.clear()
+
+
+async def post_init(application: Application) -> None:
+    loop = asyncio.get_running_loop()
+    notifications: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
+
+    def enqueue_notification(chat_id: int, text: str) -> None:
+        loop.call_soon_threadsafe(notifications.put_nowait, (chat_id, text))
+
+    application.bot_data["paper_notifications"] = notifications
+    application.bot_data["paper_trader"] = PaperTradingEngine(
+        notify=enqueue_notification
+    )
+    application.bot_data["worker_wakeup"] = asyncio.Event()
+    application.bot_data["background_tasks"] = [
+        asyncio.create_task(
+            notification_worker(application),
+            name="paper-notifications",
+        ),
+        asyncio.create_task(
+            background_worker(application),
+            name="bot-scheduler",
+        ),
+    ]
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "Menu and daily Sudan gold prices"),
+            BotCommand("price", "Get Sudan gold prices now"),
+            BotCommand("balance", "Show demo balance"),
+            BotCommand("trade", "Check the current M15 signal"),
+            BotCommand("auto_on", "Start five-minute paper trading"),
+            BotCommand("auto_off", "Stop new paper entries"),
+            BotCommand("closeall", "Close the open paper trade"),
+            BotCommand("stop", "Unsubscribe from daily prices"),
+            BotCommand("help", "Show commands"),
+        ]
+    )
+    identity = await application.bot.get_me()
+    logger.info("Connected to Telegram as @%s.", identity.username or "unknown")
+    logger.info(
+        "Daily Sudan gold prices remain scheduled for %02d:00 Africa/Khartoum.",
+        SEND_HOUR,
+    )
+    logger.info("Paper-trading commands are ready; checks run every five minutes.")
+
+
+async def post_shutdown(application: Application) -> None:
+    tasks = application.bot_data.get("background_tasks", [])
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled Telegram update error: %s", context.error)
 
 
 def run() -> None:
@@ -355,64 +502,25 @@ def run() -> None:
         raise RuntimeError("BOT_TOKEN is missing. Add it in Replit Secrets.")
 
     state = load_state()
-    bot = TelegramBot(token, state)
-    identity = bot.api_call("getMe")
-    username = identity.get("username", "unknown") if isinstance(identity, dict) else "unknown"
-    logger.info("Connected to Telegram as @%s.", username)
-    logger.info(
-        "Daily delivery is set for %02d:00 Africa/Khartoum; %d subscriber(s) saved.",
-        SEND_HOUR,
-        len(state["subscribers"]),
+    application = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
     )
-    logger.info(
-        "Paper trading is available per chat; market checks run every %d seconds.",
-        PAPER_CHECK_SECONDS,
-    )
-
-    offset: int | None = None
-    next_source_attempt = 0.0
-    next_paper_check = 0.0
-    while True:
-        now = datetime.now(TIMEZONE)
-        today = now.date().isoformat()
-        if now.hour >= SEND_HOUR and state.get("last_sent_date") != today:
-            if time.monotonic() >= next_source_attempt:
-                try:
-                    send_daily_update(bot, state, today)
-                except PriceSourceError as exc:
-                    logger.warning("Daily update postponed: %s", exc)
-                    next_source_attempt = time.monotonic() + RETRY_SECONDS
-                except TelegramAPIError as exc:
-                    logger.warning("Daily update could not be delivered: %s", exc)
-                    next_source_attempt = time.monotonic() + RETRY_SECONDS
-
-        try:
-            polling_payload: dict[str, Any] = {
-                "timeout": 25,
-                "allowed_updates": ["message"],
-            }
-            if offset is not None:
-                polling_payload["offset"] = offset
-            updates = bot.api_call("getUpdates", polling_payload)
-            for update in updates or []:
-                offset = int(update["update_id"]) + 1
-                try:
-                    bot.handle_update(update)
-                except (PriceSourceError, TelegramAPIError) as exc:
-                    logger.warning("Could not handle a bot command: %s", exc)
-        except TelegramAPIError as exc:
-            logger.warning("Bot polling will retry: %s", exc)
-            time.sleep(5)
-
-        if time.monotonic() >= next_paper_check or bot.paper_trader.check_requested:
-            try:
-                bot.paper_trader.run_cycle()
-            except PaperTradingError as exc:
-                logger.warning("Paper-trading cycle skipped: %s", exc)
-            except Exception:
-                logger.exception("Paper-trading cycle failed unexpectedly.")
-            finally:
-                next_paper_check = time.monotonic() + PAPER_CHECK_SECONDS
+    application.bot_data["state"] = state
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("balance", balance_command))
+    application.add_handler(CommandHandler("trade", trade_command))
+    application.add_handler(CommandHandler(["auto_on", "startbot"], auto_on_command))
+    application.add_handler(CommandHandler(["auto_off", "stopbot"], auto_off_command))
+    application.add_handler(CommandHandler("closeall", closeall_command))
+    application.add_error_handler(error_handler)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
