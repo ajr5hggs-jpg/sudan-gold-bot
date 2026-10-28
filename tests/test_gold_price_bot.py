@@ -74,6 +74,7 @@ class TelegramMenuTests(unittest.IsolatedAsyncioTestCase):
         save_state.assert_called_once_with(state)
         reply = reply_text.await_args.args[0]
         self.assertIn("/trade", reply)
+        self.assertIn("H1", reply)
         self.assertIn("/auto_on", reply)
         self.assertIn("/price", reply)
 

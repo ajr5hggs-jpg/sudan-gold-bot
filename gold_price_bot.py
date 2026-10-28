@@ -241,8 +241,8 @@ MENU_TEXT = (
     "الأوامر المتاحة:\n"
     "/price — أسعار الذهب السوداني الآن\n"
     "/balance — رصيد الحساب التجريبي (١٠٬٠٠٠ دولار)\n"
-    "/trade — فحص إشارة EMA/RSI الآن\n"
-    "/auto_on — تشغيل الفحص الآلي كل ٥ دقائق\n"
+    "/trade — فحص إشارة EMA/RSI على شمعة H1 مكتملة الآن\n"
+    "/auto_on — فحص كل ٥ دقائق لإشارات شموع H1 المكتملة\n"
     "/auto_off — إيقاف فتح صفقات جديدة\n"
     "/closeall — إغلاق الصفقة التجريبية المفتوحة\n"
     "/stop — إلغاء تحديثات الأسعار اليومية فقط\n\n"
@@ -467,8 +467,8 @@ async def post_init(application: Application) -> None:
             BotCommand("start", "Menu and daily Sudan gold prices"),
             BotCommand("price", "Get Sudan gold prices now"),
             BotCommand("balance", "Show demo balance"),
-            BotCommand("trade", "Check the current M15 signal"),
-            BotCommand("auto_on", "Start five-minute paper trading"),
+            BotCommand("trade", "Check the latest completed H1 signal"),
+            BotCommand("auto_on", "Scan every five minutes for closed H1 bars"),
             BotCommand("auto_off", "Stop new paper entries"),
             BotCommand("closeall", "Close the open paper trade"),
             BotCommand("stop", "Unsubscribe from daily prices"),

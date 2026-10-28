@@ -21,7 +21,9 @@ import yfinance as yf
 
 YAHOO_TICKERS = ("XAUUSD=X", "GC=F", "PAXG-USD")
 PAPER_STATE_PATH = Path(__file__).parent / "bot_data" / "paper_accounts.json"
-BAR_SECONDS = 15 * 60
+BAR_SECONDS = 60 * 60
+YAHOO_PERIOD = "60d"
+YAHOO_INTERVAL = "1h"
 PAPER_CHECK_SECONDS = 5 * 60
 MIN_HISTORY_BARS = 200
 STARTING_BALANCE_USD = 10_000.0
@@ -29,7 +31,7 @@ RISK_FRACTION = 0.02
 STOP_POINTS = 150
 TAKE_PROFIT_POINTS = 300
 POINT_SIZE_USD = 0.01
-MAX_QUOTE_AGE_SECONDS = 60 * 60
+MAX_QUOTE_AGE_SECONDS = 2 * BAR_SECONDS
 REQUEST_TIMEOUT_SECONDS = 20
 NEW_YORK = ZoneInfo("America/New_York")
 
@@ -223,7 +225,7 @@ def _parse_yahoo_frame(frame: Any, ticker: str, now_epoch: float) -> MarketData:
         raise PaperTradingError("Yahoo's latest price is too old to trade safely.")
     candles.sort(key=lambda candle: candle.timestamp)
     if len(candles) < MIN_HISTORY_BARS:
-        raise PaperTradingError("Yahoo returned too few completed 15-minute candles.")
+        raise PaperTradingError("Yahoo returned too few completed H1 candles.")
 
     if ticker == "GC=F":
         source = "Yahoo GC=F (gold-futures proxy, not spot XAUUSD)"
@@ -237,8 +239,8 @@ def _parse_yahoo_frame(frame: Any, ticker: str, now_epoch: float) -> MarketData:
 def _fetch_yahoo(ticker: str, now_epoch: float) -> MarketData:
     frame = yf.download(
         ticker,
-        period="10d",
-        interval="15m",
+        period=YAHOO_PERIOD,
+        interval=YAHOO_INTERVAL,
         progress=False,
         auto_adjust=False,
         actions=False,
@@ -265,7 +267,7 @@ def fetch_market_data(preferred_yahoo_ticker: str | None = None) -> MarketData:
 
     logger.warning("All yfinance tickers failed: %s", ", ".join(errors))
     raise PaperTradingError(
-        "No usable 15-minute data was returned by XAUUSD=X, GC=F, or PAXG-USD."
+        "No usable H1 data was returned by XAUUSD=X, GC=F, or PAXG-USD."
     )
 
 
@@ -276,6 +278,7 @@ def _new_account() -> dict[str, Any]:
         "balance_usd": STARTING_BALANCE_USD,
         "position": None,
         "last_processed_candle": 0,
+        "timeframe_seconds": BAR_SECONDS,
         "last_price": None,
         "last_price_at": 0.0,
         "source": "",
@@ -322,6 +325,11 @@ class PaperTradingEngine:
                 raise RuntimeError("A saved paper account has an unexpected format.")
             normalized = _new_account()
             normalized.update(account)
+            if account.get("timeframe_seconds") != BAR_SECONDS:
+                # Re-seed old M15 cursors on the next H1 poll; never replay
+                # historical H1 signals as if they were current entries.
+                normalized["last_processed_candle"] = 0
+                normalized["timeframe_seconds"] = BAR_SECONDS
             accounts[str(chat_id)] = normalized
         return accounts
 
@@ -366,7 +374,7 @@ class PaperTradingEngine:
             return "حساب التداول التجريبي يعمل بالفعل، وسيستمر الفحص كل ٥ دقائق."
         return (
             "تم تشغيل التداول التجريبي لهذا الحساب.\n"
-            "لا تُرسل أوامر حقيقية إلى وسيط. يبدأ الدخول عند إغلاق شمعة M15 مؤهلة؛ "
+            "لا تُرسل أوامر حقيقية إلى وسيط. يبدأ الدخول عند إغلاق شمعة H1 مؤهلة؛ "
             "قد ينتظر الحساب اكتمال بيانات EMA 200.\n"
             "مصدر البيانات: yfinance بالترتيب XAUUSD=X ثم GC=F ثم PAXG-USD. "
             "استخدم /auto_off لإيقاف الدخول."
@@ -462,7 +470,7 @@ class PaperTradingEngine:
         latest = candles[latest_index]
         if latest.timestamp <= int(account.get("last_processed_candle") or 0):
             self._save()
-            return "تم فحص آخر شمعة M15 بالفعل؛ لا توجد إشارة جديدة للتنفيذ."
+            return "تم فحص آخر شمعة H1 بالفعل؛ لا توجد إشارة جديدة للتنفيذ."
 
         closes = [candle.close for candle in candles]
         signal = crossover_signal(
@@ -475,7 +483,7 @@ class PaperTradingEngine:
         if signal is None:
             self._save()
             return (
-                "لا يوجد تقاطع جديد مؤكد بإشارة RSI على آخر شمعة M15 مكتملة؛ "
+                "لا يوجد تقاطع جديد مؤكد بإشارة RSI على آخر شمعة H1 مكتملة؛ "
                 "لم يتم فتح صفقة."
             )
 
@@ -515,7 +523,7 @@ class PaperTradingEngine:
             current = current.replace(tzinfo=timezone.utc)
         candles = sorted(market.candles, key=lambda candle: candle.timestamp)
         if not candles:
-            raise PaperTradingError("No completed 15-minute candles are available.")
+            raise PaperTradingError("No completed H1 candles are available.")
 
         closes = [candle.close for candle in candles]
         fast_ema = ema_series(closes, 50)
@@ -613,7 +621,7 @@ class PaperTradingEngine:
         )
         if notify_chat:
             self._notify(chat_id, message)
-        logger.info("Paper position opened from a new M15 crossover.")
+        logger.info("Paper position opened from a new H1 crossover.")
         return message
 
     def _candle_exit(self, position: dict[str, Any], candle: Candle) -> tuple[float, str] | None:

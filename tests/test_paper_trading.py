@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -5,10 +6,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from paper_trading import (
+    BAR_SECONDS,
     Candle,
     MarketData,
+    MIN_HISTORY_BARS,
     PaperTradingError,
     PaperTradingEngine,
+    STOP_POINTS,
+    TAKE_PROFIT_POINTS,
+    YAHOO_INTERVAL,
+    YAHOO_PERIOD,
+    _fetch_yahoo,
     crossover_signal,
     ema_series,
     fetch_market_data,
@@ -19,6 +27,23 @@ from paper_trading import (
 
 
 class IndicatorTests(unittest.TestCase):
+    def test_strategy_uses_h1_and_retains_requested_risk_limits(self) -> None:
+        self.assertEqual(BAR_SECONDS, 60 * 60)
+        self.assertEqual((YAHOO_PERIOD, YAHOO_INTERVAL), ("60d", "1h"))
+        self.assertEqual(MIN_HISTORY_BARS, 200)
+        self.assertEqual((STOP_POINTS, TAKE_PROFIT_POINTS), (150, 300))
+
+    def test_yfinance_fetches_hourly_history(self) -> None:
+        market = MarketData([], 4000.0, "test-feed", "GC=F")
+        with (
+            patch("paper_trading.yf.download", return_value=object()) as download,
+            patch("paper_trading._parse_yahoo_frame", return_value=market),
+        ):
+            self.assertIs(_fetch_yahoo("GC=F", 123.0), market)
+
+        self.assertEqual(download.call_args.kwargs["interval"], "1h")
+        self.assertEqual(download.call_args.kwargs["period"], "60d")
+
     def test_ema_uses_sma_seed_and_smoothing(self) -> None:
         self.assertEqual(ema_series([1.0, 2.0, 3.0, 4.0], 3), [None, None, 2.0, 3.0])
 
@@ -43,7 +68,7 @@ class IndicatorTests(unittest.TestCase):
 
     def test_yfinance_tickers_are_tried_in_order_until_one_works(self) -> None:
         successful = MarketData(
-            [Candle(index * 900, 4000.0, 4001.0, 3999.0, 4000.0) for index in range(200)],
+            [Candle(index * BAR_SECONDS, 4000.0, 4001.0, 3999.0, 4000.0) for index in range(200)],
             4000.0,
             "Yahoo GC=F",
             "GC=F",
@@ -62,7 +87,7 @@ class IndicatorTests(unittest.TestCase):
 
     def test_paxg_is_the_last_yfinance_fallback(self) -> None:
         successful = MarketData(
-            [Candle(index * 900, 4000.0, 4001.0, 3999.0, 4000.0) for index in range(200)],
+            [Candle(index * BAR_SECONDS, 4000.0, 4001.0, 3999.0, 4000.0) for index in range(200)],
             4000.0,
             "Yahoo PAXG-USD",
             "PAXG-USD",
@@ -140,13 +165,13 @@ class PaperAccountTests(unittest.TestCase):
                 "target_price": 103.0,
                 "size_oz": 1.0,
             }
-            candle = Candle(900, 100.0, 104.0, 98.0, 101.0)
+            candle = Candle(BAR_SECONDS, 100.0, 104.0, 98.0, 101.0)
             self.assertEqual(
                 engine._candle_exit(position, candle),
                 (98.5, "وقف الخسارة"),
             )
 
-    def test_new_m15_signal_opens_only_in_that_chat(self) -> None:
+    def test_new_h1_signal_opens_only_in_that_chat(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             notifications: list[tuple[int, str]] = []
             engine = PaperTradingEngine(
@@ -156,22 +181,57 @@ class PaperAccountTests(unittest.TestCase):
             engine.start(303)
             engine.accounts["303"]["last_processed_candle"] = 0
             candles = [
-                Candle(index * 900, 4000.0, 4000.5, 3999.5, 4000.0)
+                Candle(index * BAR_SECONDS, 4000.0, 4000.5, 3999.5, 4000.0)
                 for index in range(210)
             ]
             engine.process_market_data(
                 MarketData(candles, 4000.0, "test-feed"),
-                datetime.fromtimestamp(candles[-1].timestamp + 900, timezone.utc),
+                datetime.fromtimestamp(
+                    candles[-1].timestamp + BAR_SECONDS, timezone.utc
+                ),
             )
 
             self.assertIsNone(engine.accounts["303"]["position"])
             self.assertEqual(notifications, [])
 
+    def test_legacy_m15_cursor_reseeds_for_h1_and_preserves_open_position(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "paper.json"
+            legacy_position = {
+                "side": "long",
+                "entry_price": 4000.0,
+                "stop_price": 3998.5,
+                "target_price": 4003.0,
+                "size_oz": 1.0,
+            }
+            path.write_text(
+                json.dumps(
+                    {
+                        "505": {
+                            "enabled": True,
+                            "last_processed_candle": 1_700_000_100,
+                            "position": legacy_position,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            engine = PaperTradingEngine(
+                notify=lambda _chat_id, _message: None,
+                state_path=path,
+            )
+
+            account = engine.accounts["505"]
+            self.assertEqual(account["last_processed_candle"], 0)
+            self.assertEqual(account["timeframe_seconds"], BAR_SECONDS)
+            self.assertEqual(account["position"], legacy_position)
+
     def test_trade_command_evaluates_latest_closed_bar_and_opens_demo_position(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             notifications: list[tuple[int, str]] = []
             candles = [
-                Candle(index * 900, 4000.0, 4000.5, 3999.5, 4000.0)
+                Candle(index * BAR_SECONDS, 4000.0, 4000.5, 3999.5, 4000.0)
                 for index in range(210)
             ]
             market = MarketData(candles, 4000.0, "Yahoo GC=F", "GC=F")
